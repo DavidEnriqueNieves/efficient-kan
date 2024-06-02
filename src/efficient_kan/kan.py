@@ -3,25 +3,55 @@ import torch.nn.functional as F
 from typing import List
 import math
 
+#| This is a modified version of the `kan.py` file from the original
+#| `efficient-kan` repository. It contains many block comments for the purpose of
+#| easily exporting this to a jupyter notebook.
+
+#| Some important definitions include
+#| 
+#| $I \in \N$ , the input size of the layer, represented by `self.I` in the
+#| code
+#| 
+#| $O \in \N$, the output size of the layer, represented by `self.O` in the
+#| code
+#| 
+#| $G \in \N$, the number of grid intervals used in the spline, represented
+#| by `self.G` in the code
+#| 
+#| $K \in \N$, the order of the spline to be used for activations,
+#| represented by `self.K` in the code
+#| 
+#| $\text{grid} \in \R^{(G + 2K + 1) \times I}$, the grid on which to evaluate
+#| the splines on, represented by `self.grid` in the code. It Normally, the grid would require G + K + 1 points, but
+#| the extra K comes from evaluating the boundary points of the spline.
+#| 
+#| $b : \R \mapsto \R$ will be a function applied elementwise to any matrix
+#| that serves as its input, represented by `self.b : torch.nn.Module` in the
+#| code and having $\text{SiLU}$ as its default value
+#| 
+#| Note that the $b$ corresponds to the basis function mentioned in equation
+#| (2.10) of the paper, where the spline function is equal to:
+#| 
+#| $$ \phi(x) = w(b(x) + \text{spline}(x)) $$
+#| 
+#| ... with $b(x) = \text{silu}(x)$ in the paper.
+#| 
+#| $h \in \R$, the grid interval used for initializing the grid, represented by
+#| `h : float` in the code
+#| 
+#| #### Learnable parameters
+#| $W_{\text{base}}$, the weight used to scale the base activations, of shape $O \times I$
+#| $W_{\text{spline}}$, the weight used to scale the spline activations, of shape $O \times I \times G+K$
+#| `spline_scaler`, the weight used to scale the spline weights across the $G + K$ dimension
+#| 
+#| Note that the grid updates and is by proxy *learnable*, but it is highly dependent on the input.
+#| 
+#| 
+#| TODO: finish writing about spline scaler, 
+#| `self.scale_noise`, `self.scale_base`, `self.scale_spline`, and
+#| `self.gird_eps` are used later in the `self.init_parameters()` function call
 
 class KANLinear(torch.nn.Module):
-    """
-    Some important definitions include
-
-    $I \\in \\N$ , the input size of the layer, represented by `self.I` in the code
-
-    $O \\in \\N$, the output size of the layer, represented by `self.O` in the code
-
-    $G \\in \\N$, the number of grid intervals used in the spline, represented by `self.G` in the code
-
-    $K \\in \\N$, the order of the spline to be used for activations, represented by `self.K` in the code
-
-    The grid will be of shape  $I \\times (G + 2K + 1)$ and will be used to evaluate the spline, represented by `self.grid` in the code
-
-    $b : \\R \\mapsto \\R$ will be a function applied elementwise to any matrix that serves as its input, represented by `self.b` in the code and having $\\text{SiLU}$ as its default value
-
-    # TODO: explain the ifference between spline_weight and spline_scaler
-    """
 
     def __init__(
         self,
@@ -43,6 +73,7 @@ class KANLinear(torch.nn.Module):
         self.G: int = G
         self.K: int = K
         self.use_splines : bool = use_splines
+        self.b: torch.nn.Module = b()
 
         h: float = (grid_range[1] - grid_range[0]) / G
         
@@ -61,13 +92,12 @@ class KANLinear(torch.nn.Module):
         self.scale_noise: float = scale_noise
         self.scale_base: float = scale_base
         self.scale_spline: float = scale_spline
-        self.b: torch.nn.Module = b()
         self.grid_eps: float = grid_eps
 
         self.init_parameters()
 
 # grid is of shape I x (G + 2 * K + 1)
-"""
+r"""
 #### Weight Initialization
 
 Naturally, initializing the neurons to be the same value is redundant and
@@ -147,9 +177,13 @@ $$
 W_{i,j}^{(l)} \sim N(\mu = 0, \sigma^2 = \sqrt{\frac{2}{m^{(l-1)}}})
 $$
 
-"""
+#### Fitting the spline weight
+
+The weights of the splines are not initialized using Kaiming He initialization. Instead, random data 
+
+r"""
 def init_parameters(self):
-    """
+    r"""
     Uses Kaiming He initialization,
     a technique mainly used for initializing the weights of ReLU neural networks
 
@@ -158,7 +192,16 @@ def init_parameters(self):
     The weights are initialized from a normal distribution $\mathcal{N}(0, \frac{2}{n}$
 
     It is related to the Xavier intialization, which is more suited for activation functions like sigmoid or tanh functions.
-    """
+
+    For the spline fitting, the `noise` variable instantiation generates tensor
+    of shape $(G+1 \times I \times O)$.  
+    
+    By default,
+    [`torch.rand()`](https://pytorch.org/docs/stable/generated/torch.rand.html)
+    generates values from $[0, 1)$ with a uniform distribution, so the 1/2
+    centers the distribution. From there, a `scale_noise : float` factor is
+    applied and the entire thing is divided by $G$.
+    r"""
     torch.nn.init.kaiming_uniform_(
         self.base_weight, a=math.sqrt(5) * self.scale_base
     )
@@ -169,6 +212,7 @@ def init_parameters(self):
             / self.G
         )
 
+        # fits the coefficients of the spline to some noise data
         coefs_from_spline_data: torch.tensor = self.coefs_from_curve_data(
             self.grid.T[self.K : -self.K],
             noise,
@@ -187,11 +231,40 @@ def init_parameters(self):
 #Dynamically assign the function to the class
 KANLinear.init_parameters = init_parameters
 
+r"""
+
+This function makes use of the Cox de Boor algorithm, which in turn uses the de Boor recursive formula
+
+$$
+B_{i,0}(t) = \begin{cases} 
+      1 & \text{if} & t_i \leq t < t_{i+1} \\
+      0 & \text{otherwise}
+   \end{cases}\\
+   B_{i,p}(t) = \frac{t-t_i}{t_{i+p} - t_i}B_{i,p-1}(t)+\frac{t_{i+1}-t}{t_{i+p}-t_i}B_{i+1, p-1}(t)
+$$
+
+... where $t_i$ is the $i$th entry of the knot vector in the spline. This just
+means the $i$th input at which your $i$th control point will be evaluated at.
+
+Note that since the `grid : torch.tensor` object is handling the grid values at
+different inputs (there is an independent grid for each input), as well as for
+different piecewise segments of the spline. Hence, the grid only has two
+dimensions and will always be indexed with just two indices in the code.
+
+The `bases` variable on the other hand, will have three indices. This is because
+of the $$ function mentioned above taking in two indices $(i, p)$, and the
+argument of $t$.
+
+TODO: finish analyzing this
+In the case of the `bases` variable, it seems that the first index is the batch
+dimension corresponding to $t$ in the 
+r"""
+
 def b_splines(self, x: torch.Tensor):
-    """
+    r"""
     Used for evaluating spline curves in B-spline form.
-    """
-    """
+    r"""
+    r"""
     Compute the B-spline bases for the given input tensor using the de Boor algorithm
     (Equivalent to coef2curve in the original repo)
 
@@ -200,7 +273,7 @@ def b_splines(self, x: torch.Tensor):
 
     Returns:
         torch.Tensor: B-spline bases tensor of shape (batch_size, in_features, grid_size + spline_order).
-    """
+    r"""
     assert x.dim() == 2 and x.size(1) == self.I
 
     grid: torch.Tensor = (
@@ -231,17 +304,17 @@ def b_splines(self, x: torch.Tensor):
 #Dynamically assign the function to the class
 KANLinear.b_splines = b_splines
 
+r"""
+The solution below computes a solution to the linear system
+
+$$
+    \\underset{X \\in \\mathbb{K}}{||AX - B||_{F}}
+$$
+
+... where in this case, $A$ is taken to be
+r"""
 def coefs_from_curve_data(self, x: torch.Tensor, y: torch.Tensor):
-    """
-    The solution below computes a solution to the linear system
-
-    $$
-        \\underset{X \\in \\mathbb{K}}{||AX - B||_{F}}
-    $$
-
-    ... where in this case, $A$ is taken to be
-    """
-    """
+    r"""
     Compute the coefficients of the curve that interpolates the given points.
 
     Args:
@@ -250,7 +323,7 @@ def coefs_from_curve_data(self, x: torch.Tensor, y: torch.Tensor):
 
     Returns:
         torch.Tensor: Coefficients tensor of shape (out_features, in_features, grid_size + spline_order).
-    """
+    r"""
     assert x.dim() == 2 and x.size(1) == self.I
     assert y.size() == (x.size(0), self.I, self.O)
 
@@ -283,25 +356,43 @@ def coefs_from_curve_data(self, x: torch.Tensor, y: torch.Tensor):
 #Dynamically assign the function to the class
 KANLinear.coefs_from_curve_data = coefs_from_curve_data
 
+r"""
+Recall that the `self.spline_weight : torch.tensor` member is of shape $O \times I \times (G + K)$
+Similarly, `self.spline_scaler : torch.tensor` is of shape $O \times I$. 
+
+What the operation below does is turn `spline_scaler` into an $O \times I \times
+1$ tensor and then broadcast the multiplication across the $(G + K)$ axis. What
+this means is that `self.spline_weight` is responsible for scaling each of the
+input splines will be scaled by a certain amount depending on which node it is
+going to. Essentially, it applies a weight across the $(G + K)$ dimension,
+indicating that is is weighing the *whole* spline, globally.
+r"""
 @property
 def scaled_spline_weight(self) -> torch.tensor:
-    """Returns the scaled spline weight. In some of the other repositories, this is optional
+    r"""Returns the scaled spline weight. In some of the other repositories, this is optional
 
     Returns:
         torch.tensor: the self.spline_weight tensor but scaled
-    """
+    r"""
     return self.spline_weight * (self.spline_scaler.unsqueeze(-1))
 
 
 #Dynamically assign the function to the class
 KANLinear.scaled_spline_weight = scaled_spline_weight
 
+r"""
+For this function, the output is remarkably simple compared to the original implementation.
+It has two components: a `base_output` object, and a `spline_output` object. 
+
+The input $X \in \R^{B \times I}$ first gets evaluated element-wise with the basis function $b(\cdot)$. There is a `base_out` object, which is a tensor that is a result of multiplying $b(X) \in \R^{B \times I}$ with $W_{\text{base}}^{\intercal} \in \R^{I \times O}$ through the action of the python function [`F.linear()`](https://pytorch.org/docs/stable/generated/torch.nn.functional.linear.html). 
+
+Next, the result of the B-spline evaluation with the points of $X$ is calculated using the function `self.b_splines()`.  This is then scaled by `scaled_spline_weight`, which is a weight for the splines which combines both the regular weight $W_{spline} \in \R^{O \times I \times (G+K)}$ and a scaler known as `self.spline_scaler` which is in $\R ^{O \times I}$  and has the purpose of broadcasting a weight for every input spline of every node in this layer. In other words, it scales all parts of each input spline of each node *equally* as opposed to scaling certain parts of the spline differently. Of course, this *equal* weighing will still vary across the inputs for every node in this layer.
+
+Finally, after applying the scaling to the output of `b_splines()` , the spline component and the base component of the output are added together as in equation (2.10) of the paper.
+
+r"""
 
 def forward(self, x: torch.Tensor):
-    """
-    In this function,
-    $X \\in \\R^{B \\times I}$, where $B \\in \\N$ is the batch size, and $I \\in N$ is the input dimension that the layer takes in
-    """
     assert x.dim() == 2 and x.size(1) == self.I
 
     base_output = F.linear(self.b(x), self.base_weight)
@@ -321,8 +412,8 @@ def forward(self, x: torch.Tensor):
 #Dynamically assign the function to the class
 KANLinear.forward = forward
 
-"""
-This is noted in the paper (Liu et al.) as being one of the key implementation
+r"""
+This is noted in the paper as being one of the key implementation
 details to making 
 KANs optimizable. The grid update step is one of these implementation details.
 
@@ -334,42 +425,76 @@ NOTE that this means that the splines will still evaluate, but it's likely that
 the result will not be favorable due to the coefficients of the splines not
 necessarily accounting for that input region.
 
-"""
+
+Noting that $X \in \R^{B \times I}$, what this step does is that it sorts the
+$X$ input values along the $B$ dimension, and does two things:
+
+it creates a `grid_adaptive` tensor and a `grid_uniform` tensor
+
+With the grid_adaptive tensor, it simply takes $G + 1$ samples from `x_sorted`
+With `grid_uniform`, it creates evenly spaced $G+1$ samples from the highest and
+lowest values of $X$ and populates the array using those esmaples
+
+Afterwards, `grid` is reinitialized as a convex combination of `grid_uniform` and
+`grid_adaptive` using `self.grid_eps : float` as the factor. Note that by
+default, `self.grid_eps` is fairly small, so `grid` will mostly take on the
+values of `grid_adaptive`, i.e. non-evenly spaced samples from the original
+sorted $X$ along the $B$ dimension.
+
+Finally, `grid` is added two extensions at  the start and at the end, each a
+`torch.tensor` of length $K$ for the purpose of evaluating the spline at the
+boundary points.
+
+r"""
 @torch.no_grad()
 def update_grid(self, x: torch.Tensor, margin=0.01):
-    """Update grid
+    r"""Update grid
+
+    Recall: the grid is of shape: $\R^{(G + 2K + 1) \times I}$
 
     Args:
         x (torch.Tensor): input tensor to base the update off of
         margin (float, optional): Margin for the uniform extension of the grid. Defaults to 0.01.
-    """
+    r"""
     assert x.dim() == 2 and x.size(1) == self.I
     batch = x.size(0)
 
-    splines = self.b_splines(x)  # (batch, in, coeff)
+    splines : torch.tensor = self.b_splines(x)  # (batch, in, coeff)
     splines = splines.permute(1, 0, 2)  # (in, batch, coeff)
-    orig_coeff = self.scaled_spline_weight  # (out, in, coeff)
+    orig_coeff : torch.tensor = self.scaled_spline_weight  # (out, in, coeff)
     orig_coeff = orig_coeff.permute(1, 2, 0)  # (in, coeff, out)
-    unreduced_spline_output = torch.bmm(splines, orig_coeff)  # (in, batch, out)
+    unreduced_spline_output : torch.tensor = torch.bmm(splines, orig_coeff)  # (in, batch, out)
     unreduced_spline_output = unreduced_spline_output.permute(
         1, 0, 2
     )  # (batch, in, out)
 
     # sort each channel individually to collect data distribution
-    x_sorted = torch.sort(x, dim=0)[0]
-    grid_adaptive = x_sorted[
+    x_sorted : torch.tensor = torch.sort(x, dim=0)[0]
+    # selects G samples from x_sorted
+    grid_adaptive : torch.tensor  = x_sorted[
         torch.linspace(0, batch - 1, self.G + 1, dtype=torch.int64, device=x.device)
     ]
 
-    uniform_step = (x_sorted[-1] - x_sorted[0] + 2 * margin) / self.G
-    grid_uniform = (
+    # take the highest and lowest x values respectively, add a margin, and divide by G
+    uniform_step : torch.tensor = (x_sorted[-1] - x_sorted[0] + 2 * margin) / self.G
+    # take a vector of shape (G + 1 x 1) and 
+    #
+    # e.g. a tensor of this form
+    # tensor([[0.],
+    #     [1.],
+    #     [2.],
+    #     [...],
+    #     [G]])
+    # then, multiply it by the uniform step and add by the lower bound to frame
+    # it within the bounds of the highest and lowest x values plus a margin so far
+    grid_uniform : torch.tensor = (
         torch.arange(self.G + 1, dtype=torch.float32, device=x.device).unsqueeze(1)
         * uniform_step
         + x_sorted[0]
         - margin
     )
 
-    grid = self.grid_eps * grid_uniform + (1 - self.grid_eps) * grid_adaptive
+    grid : torch.tensor = self.grid_eps * grid_uniform + (1 - self.grid_eps) * grid_adaptive
     grid = torch.concatenate(
         [
             grid[:1]
@@ -383,7 +508,11 @@ def update_grid(self, x: torch.Tensor, margin=0.01):
         dim=0,
     )
 
+    # adds 2k steps for the purpose of evaluating spline at boundary points
+    # grid is now of shape self.G + 2 * self.K + 1
     self.grid.copy_(grid.T)
+
+    # fits the curve once again from the updated grid using the same old data points as before
     self.spline_weight.data.copy_(
         self.coefs_from_curve_data(x, unreduced_spline_output)
     )
@@ -391,8 +520,67 @@ def update_grid(self, x: torch.Tensor, margin=0.01):
 #Dynamically assign the function to the class
 KANLinear.update_grid = update_grid
 
+r"""
+
+In Section 2.5.1 of the paper, they define L1 regularization and later on,
+entropy regularization.
+
+For the definition of the L1 norm in (2.17), they use 
+
+$$
+|\phi|_1 = \frac{1}{N_p} \sum_{s=1}^{N_p} \left| \phi(x^{(s)}) \right|
+$$
+
+Hence, for the entire layer, the L1 norm (2.18) is defined as
+
+$$
+|\Phi|_1  = \sum_{i=1}^{n_{in}}\sum_{j=1}^{n_{out}} |\phi_{i,j}|_1
+$$
+
+Furthermore, the entropy (2.19) is defined to be
+
+$$
+S(\Phi) = -\sum_{i=1}^{n_{in}} \sum_{j=1}^{n_{out}}  \frac{|\phi_{i,j}|_1}{|\Phi|_1} \text{log} \left( \frac{|\phi_{i,j}|_1}{|\Phi|_1}  \right)
+$$
+
+$$
+\ell_{\text{total}} = \ell_{\text{pred}} + \lambda \left( \mu_1 \sum_{l=0}^{L-1} |\Phi|_1 + \mu_2 \sum_{l=0}^{L-1} S(\Phi_l) \right)
+$$
+
+... where $\mu_1$, $\mu_2$ are relative magnitudes usually set to 1, and
+$\lambda$ controls overall regularization magnitude.
+
+Their original implementation is 
+
+```python3
+        def reg(acts_scale):
+
+            def nonlinear(x, th=small_mag_threshold, factor=small_reg_factor):
+                return (x < th) * x * factor + (x > th) * (x + (factor - 1) * th)
+
+            reg_ = 0.
+            for i in range(len(acts_scale)):
+                vec = acts_scale[i].reshape(-1, )
+
+                p = vec / torch.sum(vec)
+                l1 = torch.sum(nonlinear(vec))
+                entropy = - torch.sum(p * torch.log2(p + 1e-4))
+                reg_ += lamb_l1 * l1 + lamb_entropy * entropy  # both l1 and entropy
+
+            # regularize coefficient to encourage spline to be zero
+            for i in range(len(self.act_fun)):
+                coeff_l1 = torch.sum(torch.mean(torch.abs(self.act_fun[i].coef), dim=1))
+                coeff_diff_l1 = torch.sum(torch.mean(torch.abs(torch.diff(self.act_fun[i].coef)), dim=1))
+                reg_ += lamb_coef * coeff_l1 + lamb_coefdiff * coeff_diff_l1
+
+            return reg_
+```
+
+However, this implementation makes use of their own way of simulating this.
+r"""
+
 def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
-    """
+    r"""
     Compute the regularization loss.
 
     This is a dumb simulation of the original L1 regularization as stated in the
@@ -403,7 +591,7 @@ def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0)
     The L1 regularization is now computed as mean absolute value of the spline
     weights. The authors implementation also includes this term in addition to the
     sample-based regularization.
-    """
+    r"""
     l1_fake = self.spline_weight.abs().mean(-1)
     regularization_loss_activation = l1_fake.sum()
     p = l1_fake / regularization_loss_activation
@@ -452,15 +640,15 @@ class KAN(torch.nn.Module):
                 )
             )
 
-    """
-        Fairly simple application of KAT theorem laid out in the paper, i.e.
+r"""
+    Fairly simple application of KAT theorem laid out in the paper, i.e.
 
-        $$
-            f(x) \\approx \\Phi_L \\circ \\Phi_{L-1} \\circ \\dots \\circ \\Phi_1(X)
-        $$
-        , with $X \\in \\R^{B \\times I}$
+    $$
+        f(x) \approx \Phi_L \circ \Phi_{L-1} \circ \dots \circ \Phi_1(X)
+    $$
+    , with $X \in \R^{B \times I}$
 
-    """
+r"""
 
 def forward(self, x: torch.Tensor, update_grid=False):
     for layer in self.layers:
@@ -482,3 +670,18 @@ def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0)
 
 #Dynamically assign the function to the class
 KAN.regularization_loss = regularization_loss
+
+
+"""
+#### Things to add to this notebook
+
+
+Interpretability features
+
+
+The original code for plotting the graphs showing how the splines replicate
+univariate functions at different points is unfortunately not organized in the most cohesive manner.
+In addition, this implementation focuses on efficiency, so it does not store the
+preactivations or postactivations of the layers. This could be improved upon in
+the future.
+"""
