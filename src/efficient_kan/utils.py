@@ -1,6 +1,7 @@
 from pathlib import Path
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from plotly.offline import iplot, init_notebook_mode
 import matplotlib.pyplot as plt
 import os
 from typing import Dict, List, Tuple, Union, Optional, TypedDict, Any
@@ -210,6 +211,7 @@ class CommonUtils:
         x_bounds: Bounds = None,
         y_bounds: Bounds = None,
         z_bounds: Bounds = None,
+        show : bool = False
     ):
         if not path.parent.exists():
             dir_str: str = str(path.parent.absolute())
@@ -250,6 +252,10 @@ class CommonUtils:
         )
 
         # Save the plot to a file
+        if show:
+            print("Showing plot in notebook...")
+            fig.show(renderer="colab")
+
         fig.write_html(str(path))
         print(f"Saving figure to {path}")
 
